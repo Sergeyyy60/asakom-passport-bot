@@ -29,7 +29,6 @@ PHOTO_EXT = (".jpg", ".jpeg", ".png")
 LISTS = {
     "osn": ("Основа", "Основа.xlsx"),
     "all": ("Общий список", "Общая табличка.xlsx"),
-    "both": ("Оба списка вместе", None),     # объединение без повторов
 }
 
 
@@ -190,17 +189,6 @@ def norm(s):
 
 
 async def load_people(key):
-    if LISTS[key][1] is None:          # «Оба списка» — склеить все таблицы
-        merged, seen = [], set()
-        for k, (_, fname) in LISTS.items():
-            if not fname:
-                continue
-            for p in await load_people(k):
-                uid = (norm(p["fio"]), re.sub(r"\D", "", p["passport"]))
-                if uid not in seen:
-                    seen.add(uid)
-                    merged.append(p)
-        return sorted(merged, key=lambda p: norm(p["fio"]))
     data = await STORAGE.read(LISTS[key][1])
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
     ws = wb.active
@@ -261,9 +249,9 @@ def kb_lists(uid=None):
         b.button(text=title, callback_data=f"L:{key}")
     if uid in ADMINS:
         b.button(text="👥 Доступ", callback_data="ADM")
-        b.adjust(2, 1, 1)
-    else:
         b.adjust(2, 1)
+    else:
+        b.adjust(2)
     return b.as_markup()
 
 
