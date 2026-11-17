@@ -29,6 +29,7 @@ PHOTO_EXT = (".jpg", ".jpeg", ".png")
 LISTS = {
     "osn": ("Основа", "Основа.xlsx"),
     "all": ("Общий список", "Общая табличка.xlsx"),
+    "both": ("Оба списка вместе", None),     # объединение без повторов
 }
 
 
@@ -164,6 +165,11 @@ def fmt_passport(v):
 
 def fmt_issued(v):
     """-> 'ДД.ММ.ГГГГ Кем выдан КОД'"""
+    return " ".join(p for p in parse_issued(v) if p)
+
+
+def parse_issued(v):
+    """-> (дата, кем выдан, код подразделения)"""
     s = clean(v)
     m_date = re.search(r"\d{2}\.\d{2}\.\d{4}", s)
     date = m_date.group(0) if m_date else ""
@@ -176,7 +182,7 @@ def fmt_issued(v):
     s = re.sub(r"(?i)код подразделения|подразделение\s*:?|подраздел\s*:?|дата выдачи", "", s)
     s = re.sub(r"\s*,\s*(,\s*)+", ", ", s)
     s = re.sub(r"\s+", " ", s).strip(" ,:;")
-    return " ".join(p for p in (date, s, code) if p)
+    return date, s, code
 
 
 def norm(s):
@@ -184,6 +190,17 @@ def norm(s):
 
 
 async def load_people(key):
+    if LISTS[key][1] is None:          # «Оба списка» — склеить все таблицы
+        merged, seen = [], set()
+        for k, (_, fname) in LISTS.items():
+            if not fname:
+                continue
+            for p in await load_people(k):
+                uid = (norm(p["fio"]), re.sub(r"\D", "", p["passport"]))
+                if uid not in seen:
+                    seen.add(uid)
+                    merged.append(p)
+        return sorted(merged, key=lambda p: norm(p["fio"]))
     data = await STORAGE.read(LISTS[key][1])
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
     ws = wb.active
@@ -193,11 +210,15 @@ async def load_people(key):
         fam, name, otch = clean(row[1]), clean(row[2]), clean(row[3])
         if not fam:
             continue
+        date, issuer, code = parse_issued(row[6])
         people.append({
             "fio": " ".join(p for p in (fam, name, otch) if p),
             "short": f"{fam} {name}".strip(),
+            "fam": fam, "name": name, "otch": otch,
+            "birth": clean(row[4]),
             "passport": fmt_passport(row[5]),
             "issued": fmt_issued(row[6]),
+            "date": date, "issuer": issuer, "code": code,
             "address": clean(row[7]),
         })
     return people
@@ -240,9 +261,9 @@ def kb_lists(uid=None):
         b.button(text=title, callback_data=f"L:{key}")
     if uid in ADMINS:
         b.button(text="👥 Доступ", callback_data="ADM")
-        b.adjust(2, 1)
+        b.adjust(2, 1, 1)
     else:
-        b.adjust(2)
+        b.adjust(2, 1)
     return b.as_markup()
 
 
@@ -312,6 +333,7 @@ def kb_format():
     b.button(text="📷+📝 Фото + текст", callback_data="F:pt")
     b.button(text="📷 Только фото", callback_data="F:p")
     b.button(text="📝 Только текст", callback_data="F:t")
+    b.button(text="📊 Excel-таблицей", callback_data="F:x")
     b.button(text="⬅️ К списку", callback_data="LIST")
     b.adjust(1)
     return b.as_markup()
@@ -464,7 +486,7 @@ async def on_cb(cb: CallbackQuery, bot: Bot):
         except Exception as e:
             logging.exception("load")
             await cb.answer()
-            return await cb.message.answer(f"Не удалось открыть {LISTS[key][1]}: {e}")
+            return await cb.message.answer(f"Не удалось открыть «{LISTS[key][0]}»: {e}")
         STATE[uid] = s = {"list": key, "people": people, "selected": set(),
                           "filter": "", "page": 0, "msg_id": cb.message.message_id}
         await edit_list(cb, s)
@@ -500,6 +522,8 @@ async def on_cb(cb: CallbackQuery, bot: Bot):
         s["pm"] = s["tx"] = None
         if s["fmt"] in ("pt", "p"):
             await cb.message.edit_text("Фото отправить:", reply_markup=kb_photo_mode())
+        elif s["fmt"] == "x":
+            await cb.message.edit_text("Что включить в таблицу?", reply_markup=kb_text_mode())
         else:
             await cb.message.edit_text("Какой текст?", reply_markup=kb_text_mode())
     elif data.startswith("PM:"):
@@ -571,7 +595,54 @@ async def send_result(bot: Bot, chat_id, s):
         if msg:
             await bot.send_message(chat_id, msg, parse_mode=None)
 
+    if fmt == "x":
+        name = f"Список_{datetime.now():%d.%m.%Y}.xlsx"
+        await bot.send_document(chat_id, BufferedInputFile(make_xlsx(chosen, tx == "full"), name))
+
     await bot.send_message(chat_id, "Готово ✅", reply_markup=kb_after())
+
+
+# ---------------------------------------------------------------- файлы
+def make_xlsx(people, full):
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Список"
+    cols = [("№", 5), ("Фамилия", 16), ("Имя", 13), ("Отчество", 17)]
+    if full:
+        cols.append(("Место рождения", 28))
+    cols += [("Паспорт серия и номер", 14), ("Дата выдачи", 12), ("Кем выдан", 45), ("Код подразд.", 11)]
+    if full:
+        cols.append(("Адрес регистрации", 45))
+    ws.append([c for c, _ in cols])
+    for i, p in enumerate(people, 1):
+        row = [i, p["fam"], p["name"], p["otch"]]
+        if full:
+            row.append(p["birth"])
+        row += [p["passport"], p["date"], p["issuer"], p["code"]]
+        if full:
+            row.append(p["address"])
+        ws.append(row)
+    thin = Side(style="thin", color="A6A6A6")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for j, (_, w) in enumerate(cols, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(j)].width = w
+    for r, row in enumerate(ws.iter_rows(), 1):
+        for c in row:
+            c.border = border
+            c.alignment = Alignment(wrap_text=True, vertical="top",
+                                    horizontal="center" if r == 1 or c.column == 1 else "left")
+            c.number_format = "@"
+            if r == 1:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="1F4E79")
+    ws.freeze_panes = "B2"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 async def main():
